@@ -1,7 +1,7 @@
 import { Telegraf } from 'telegraf';
 import mongoose from 'mongoose';
 import dotenv from 'dotenv';
-import { MongoClient } from 'mongodb';
+import cron from 'node-cron';
 
 dotenv.config();
 
@@ -18,14 +18,23 @@ interface Poll {
 }
 
 // Подключение к БД с проверкой
-async function getDb() {
+import { Db } from 'mongodb';
+
+async function getDb(): Promise<Db> {
     try {
         if (mongoose.connection.readyState === 1) {
+            if (!mongoose.connection.db) {
+                throw new Error('MongoDB connection established, but db is undefined');
+            }
             return mongoose.connection.db;
         }
 
         await mongoose.connect(process.env.MONGODB_URI!);
         console.log('MongoDB connected');
+
+        if (!mongoose.connection.db) {
+            throw new Error('MongoDB connected, but db is undefined');
+        }
         return mongoose.connection.db;
     } catch (err) {
         console.error('MongoDB connection error:', err);
@@ -219,12 +228,37 @@ bot.catch((err, ctx) => {
     console.error(`Error for ${ctx.updateType}:`, err);
 });
 
-// Запуск бота
+function startScheduler() {
+    cron.schedule('* * * * *', async () => {
+        try {
+            const db = await getDb();
+            const now = new Date();
+            const day = ['Вс', 'Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб'][now.getDay()];
+            const time = now.toTimeString().slice(0, 5); // формат HH:MM
+
+            const polls = await db.collection<Poll>('polls').find({ days: day, time }).toArray();
+            for (const poll of polls) {
+                await bot.telegram.sendPoll(
+                    poll.chatId,
+                    poll.question,
+                    poll.options,
+                    { is_anonymous: false }
+                );
+            }
+        } catch (err) {
+            console.error('Scheduler error:', err);
+        }
+    });
+
+    console.log('⏰ Шедулер запущен');
+}
+
 async function startBot() {
     try {
         await getDb(); // Проверяем подключение к БД перед запуском
         await bot.launch();
         console.log('Бот успешно запущен!');
+        startScheduler(); // 👈 запуск шедулера
     } catch (err) {
         console.error('Failed to start bot:', err);
         process.exit(1);

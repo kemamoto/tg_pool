@@ -1,57 +1,66 @@
-import { Telegraf } from "telegraf";
-import { message } from "telegraf/filters";
-import dotenv from "dotenv";
-import connectDB from "./db";
-import { setupAdminCommands } from "./commands/admin";
-import { setupPollCommands } from "./commands/poll";
-import { setupScheduleCommands } from "./commands/schedule";
-import { startPollScheduler } from "./cron/scheduler";
-import { Admin } from "./models/Admin"; // Добавляем импорт модели
+import { Telegraf } from 'telegraf';
+import mongoose from 'mongoose';
+import dotenv from 'dotenv';
 
 dotenv.config();
 
-const BOT_TOKEN = process.env.BOT_TOKEN!;
-const CREATOR_ID = parseInt(process.env.CREATOR_ID!); // Получаем ID из .env
-const bot = new Telegraf(BOT_TOKEN);
-
-// Подключение к БД
-connectDB();
-
-// Инициализация создателя (добавляем этот блок)
-async function initializeCreator() {
+// Подключение к БД с обработкой ошибок
+async function connectDB() {
     try {
-        const creatorExists = await Admin.exists({ userId: CREATOR_ID });
-        if (!creatorExists) {
-            await Admin.create({
-                userId: CREATOR_ID,
-                username: 'creator', // или process.env.CREATOR_USERNAME
-                isCreator: true
-            });
-            console.log(`Creator ${CREATOR_ID} initialized`);
-        }
+        await mongoose.connect(process.env.MONGODB_URI!);
+        console.log('MongoDB connected');
+        return mongoose.connection.db;
     } catch (err) {
-        console.error('Failed to initialize creator:', err);
+        console.error('MongoDB connection error:', err);
+        throw err;
     }
 }
 
-// Регистрация команд
-setupAdminCommands(bot);
-setupPollCommands(bot);
-setupScheduleCommands(bot);
+const bot = new Telegraf(process.env.BOT_TOKEN!);
 
-// Запуск планировщика опросов
-startPollScheduler(bot);
+// Проверка прав
+function checkAccess(userId: number): boolean {
+    const admins = process.env.ADMIN_IDS?.split(',') || [];
+    return (
+        userId.toString() === process.env.CREATOR_ID ||
+        admins.includes(userId.toString())
+    );
+}
 
-// Обработка ошибок
-bot.catch((err, ctx) => {
-    console.error(`Error for ${ctx.updateType}:`, err);
+// Главная команда
+bot.command('newpoll', async (ctx) => {
+    if (!checkAccess(ctx.from.id)) {
+        return ctx.reply('❌ Только для админов!');
+    }
+
+    try {
+        const db = await connectDB();
+        if (!db) throw new Error('No database connection');
+
+        const match = ctx.message.text.match(/^\/newpoll\s+"(.+?)"\s+(.+?)\s+([А-Яа-я,]+)\s+(\d{1,2}:\d{2})$/);
+
+        if (!match) {
+            return ctx.reply('❌ Формат: /newpoll "Вопрос" "Вариант1" "Вариант2" ... Дни(Пн,Ср) Время(13:00)');
+        }
+
+        const [_, question, optionsStr, daysStr, time] = match;
+        const options = optionsStr.split('" "').map(opt => opt.replace(/"/g, ''));
+        const days = daysStr.split(',');
+
+        await db.collection('polls').insertOne({
+            question,
+            options,
+            days,
+            time,
+            chatId: ctx.chat.id,
+            createdAt: new Date()
+        });
+
+        ctx.reply(`✅ Опрос создан!\nВопрос: ${question}\nВарианты: ${options.join(', ')}\nДни: ${days.join(', ')}\nВремя: ${time}`);
+    } catch (err) {
+        console.error(err);
+        ctx.reply('❌ Ошибка: ' + (err instanceof Error ? err.message : 'Неизвестная ошибка'));
+    }
 });
 
-// Инициализация и запуск (изменяем этот блок)
-initializeCreator().then(() => {
-    bot.launch().then(() => console.log("Bot started!"));
-});
-
-// Graceful shutdown
-process.once("SIGINT", () => bot.stop("SIGINT"));
-process.once("SIGTERM", () => bot.stop("SIGTERM"));
+bot.launch().then(() => console.log('Бот запущен!'));
